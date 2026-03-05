@@ -1,0 +1,12 @@
+[submodule "pillar1_sim/upstream"]
+	path = pillar1_sim/upstream
+	url = https://github.com/monemati/RTABMap-ROS2-PX4
+[submodule "pillar2_slicer/upstream"]
+	path = pillar2_slicer/upstream
+	url = https://github.com/Taeyoung96/OctoMap-ROS2
+[submodule "pillar3_drl/upstream"]
+	path = pillar3_drl/upstream
+	url = https://github.com/Zhefan-Xu/NavRL
+[submodule "pillar4_reward/upstream"]
+	path = pillar4_reward/upstream
+	url = https://github.com/HKUST-Aerial-Robotics/FUEL

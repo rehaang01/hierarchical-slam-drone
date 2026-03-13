@@ -6,10 +6,11 @@
 //   2. Slices the OctoMap at altitude Z ± 0.5m
 //   3. Builds a 3-channel grid:
 //        Channel 1 (obstacles): 100 = wall/object
-//        Channel 2 (free space): 50 = explored free area
-//        Channel 3 (unknown):    0  = never seen
+//        Channel 2 (free space):  0 = explored free area
+//        Channel 3 (drone pose): 50 = drone's current position
+//        (unknown cells default to -1)
 //   4. Counts frontiers (boundary between free and unknown)
-//   5. If frontiers == 0: Z-Supervisor triggers altitude shift
+//   5. If frontiers < threshold: Z-Supervisor triggers altitude shift
 //   6. Publishes the 2D grid for Pillar 3
 // ============================================================
 
@@ -32,6 +33,7 @@
 #include <string>
 #include <vector>
 #include <cmath>     // For math functions like fabs()
+#include <mutex>     // For thread-safe access to shared data
 
 // ============================================================
 // NODE CLASS DEFINITION
@@ -97,6 +99,7 @@ public:
     current_altitude_ = 1.5;
     has_octomap_ = false;
     has_odom_ = false;
+    altitude_shifting_ = false;  // Cooldown flag: true while a vertical shift is in progress
 
     RCLCPP_INFO(this->get_logger(), "Slicer Node ready. Waiting for OctoMap and Odometry...");
   }
@@ -108,11 +111,23 @@ private:
   // ============================================================
   void odomCallback(const nav_msgs::msg::Odometry::SharedPtr msg)
   {
+    std::lock_guard<std::mutex> lock(data_mutex_);
     // msg->pose.pose.position.z is the drone's height above ground
     current_altitude_ = msg->pose.pose.position.z;
     current_x_ = msg->pose.pose.position.x;
     current_y_ = msg->pose.pose.position.y;
     has_odom_ = true;
+
+    // If a vertical shift was commanded, check if we've reached the target altitude.
+    // We consider arrival when within 0.15m of the target — clear the cooldown.
+    if (altitude_shifting_ &&
+        std::fabs(current_altitude_ - altitude_target_) < 0.15)
+    {
+      altitude_shifting_ = false;
+      RCLCPP_INFO(this->get_logger(),
+        "Z-Supervisor: Arrived at target altitude %.2fm. Resuming normal exploration.",
+        current_altitude_);
+    }
   }
 
   // ============================================================
@@ -133,6 +148,7 @@ private:
 
   // Case 1: normal OcTree
   if (auto oc = dynamic_cast<octomap::OcTree*>(tree)) {
+    std::lock_guard<std::mutex> lock(data_mutex_);
     octomap_.reset(oc);
     has_octomap_ = true;
     RCLCPP_INFO(this->get_logger(), "Stored OcTree directly");
@@ -158,8 +174,11 @@ private:
         occupied);
     }
 
-    octomap_ = converted;
-    has_octomap_ = true;
+    {
+      std::lock_guard<std::mutex> lock(data_mutex_);
+      octomap_ = converted;
+      has_octomap_ = true;
+    }
 
     delete color_tree;
 
@@ -180,22 +199,32 @@ private:
   // ============================================================
   void timerCallback()
   {
-    // Safety check: don't process if we don't have data yet
-    if (!has_octomap_ || !has_odom_) {
-      RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-        "Waiting for data... OctoMap: %s, Odometry: %s",
-        has_octomap_ ? "YES" : "NO",
-        has_odom_ ? "YES" : "NO");
-      return;
+    // Take a snapshot of shared state under the lock, then release immediately.
+    // This avoids holding the mutex while doing the heavy OctoMap iteration.
+    std::shared_ptr<octomap::OcTree> octomap_snapshot;
+    double altitude, pos_x, pos_y;
+    {
+      std::lock_guard<std::mutex> lock(data_mutex_);
+      if (!has_octomap_ || !has_odom_) {
+        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+          "Waiting for data... OctoMap: %s, Odometry: %s",
+          has_octomap_ ? "YES" : "NO",
+          has_odom_ ? "YES" : "NO");
+        return;
+      }
+      octomap_snapshot = octomap_;
+      altitude = current_altitude_;
+      pos_x    = current_x_;
+      pos_y    = current_y_;
     }
 
     // ── STEP A: Define the altitude slice bounds ──
-    double z_min = current_altitude_ - slice_thickness_;
-    double z_max = current_altitude_ + slice_thickness_;
+    double z_min = altitude - slice_thickness_;
+    double z_max = altitude + slice_thickness_;
 
     RCLCPP_DEBUG(this->get_logger(), 
       "Slicing at Z=%.2f (range: %.2f to %.2f)", 
-      current_altitude_, z_min, z_max);
+      altitude, z_min, z_max);
 
     // ── STEP B: Create the output 2D grid ──
     // OccupancyGrid is a standard ROS2 message for 2D maps
@@ -210,8 +239,8 @@ private:
     grid_msg->info.height = grid_size_;   // 50 cells tall
     
     // Center the grid on the drone's current position
-    grid_msg->info.origin.position.x = current_x_ - (grid_size_ * grid_resolution_) / 2.0;
-    grid_msg->info.origin.position.y = current_y_ - (grid_size_ * grid_resolution_) / 2.0;
+    grid_msg->info.origin.position.x = pos_x - (grid_size_ * grid_resolution_) / 2.0;
+    grid_msg->info.origin.position.y = pos_y - (grid_size_ * grid_resolution_) / 2.0;
     grid_msg->info.origin.position.z = 0.0;
     
     // Initialize all cells as unknown (-1)
@@ -225,7 +254,7 @@ private:
 
     // Loop through every leaf node in the OctoMap
     // A "leaf" is the smallest voxel (no children)
-    for (auto it = octomap_->begin_leafs(); it != octomap_->end_leafs(); ++it)
+    for (auto it = octomap_snapshot->begin_leafs(); it != octomap_snapshot->end_leafs(); ++it)
     {
       // Get this voxel's 3D position
       double vox_x = it.getX();
@@ -281,16 +310,18 @@ private:
     // Log the current state
     RCLCPP_INFO(this->get_logger(),
       "Slice stats | Alt: %.1fm | Occupied: %d | Free: %d | Frontiers: %d",
-      current_altitude_, occupied_count, free_count, frontier_count);
+      altitude, occupied_count, free_count, frontier_count);
 
     // ── STEP F: Z-Supervisor Logic ──
-    // If frontiers are below threshold, current floor is complete
-    if (frontier_count < frontier_threshold_) {
+    // If frontiers are below threshold, current floor is complete.
+    // The altitude_shifting_ cooldown prevents re-triggering while the drone
+    // is already executing a vertical transition.
+    if (frontier_count < frontier_threshold_ && !altitude_shifting_) {
       RCLCPP_WARN(this->get_logger(),
         "FRONTIER STARVATION DETECTED! Only %d frontiers. Triggering Z-Supervisor...",
         frontier_count);
       
-      triggerAltitudeShift();
+      triggerAltitudeShift(altitude, pos_x, pos_y, octomap_snapshot);
     }
 
     // ── STEP G: Publish the grid ──
@@ -336,25 +367,30 @@ private:
 
   // ============================================================
   // Z-SUPERVISOR: Commands drone to shift altitude
-  // Called when frontier count drops to zero
+  // Called when frontier count drops below threshold and no shift is in progress.
+  // Takes local snapshots of position and map to avoid holding the mutex.
   // ============================================================
-  void triggerAltitudeShift()
+  void triggerAltitudeShift(double altitude, double pos_x, double pos_y,
+                             std::shared_ptr<octomap::OcTree> octomap_snap)
   {
     // Check if there's unexplored space above the drone
-    double probe_z_above = current_altitude_ + altitude_shift_;
-    double probe_z_below = current_altitude_ - altitude_shift_;
+    double probe_z_above = altitude + altitude_shift_;
+    double probe_z_below = altitude - altitude_shift_;
     
-    // Count unknown voxels above
-    int unknown_above = countUnknownVoxelsAtAltitude(probe_z_above);
-    int unknown_below = countUnknownVoxelsAtAltitude(probe_z_below);
+    // Count unknown voxels above and below
+    int unknown_above = countUnknownVoxelsAtAltitude(probe_z_above, pos_x, pos_y, octomap_snap);
+    int unknown_below = countUnknownVoxelsAtAltitude(probe_z_below, pos_x, pos_y, octomap_snap);
 
     RCLCPP_INFO(this->get_logger(),
       "Bidirectional Probe | Unknown above: %d | Unknown below: %d",
       unknown_above, unknown_below);
 
-    // Choose direction with more unknown space
     double target_altitude;
-    if (unknown_above >= unknown_below && probe_z_above > 0.3) {
+
+    // FIX: require unknown_above > 0 so we don't command ascent into fully
+    // mapped space (previously `unknown_above >= unknown_below` was true when
+    // both were 0, causing endless upward drift).
+    if (unknown_above > 0 && unknown_above >= unknown_below && probe_z_above > 0.3) {
       target_altitude = probe_z_above;
       RCLCPP_WARN(this->get_logger(), 
         "Z-Supervisor: Commanding ASCENT to %.1fm", target_altitude);
@@ -368,8 +404,12 @@ private:
       return;
     }
 
-    // Publish the altitude command
-    // Pillar 5 (Nav2) will listen to this and execute the movement
+    // Set cooldown: suppress re-triggering until odomCallback confirms arrival
+    altitude_shifting_ = true;
+    altitude_target_   = target_altitude;
+
+    // Publish the altitude command.
+    // Pillar 5 (Nav2) will listen to this and execute the movement.
     auto alt_msg = std_msgs::msg::Float32();
     alt_msg.data = static_cast<float>(target_altitude);
     altitude_cmd_pub_->publish(alt_msg);
@@ -377,27 +417,29 @@ private:
 
   // ============================================================
   // HELPER: Count unknown voxels at a given altitude
-  // Used by Z-Supervisor to decide which direction to go
+  // Used by Z-Supervisor to decide which direction to go.
+  // Samples a thin band (target_z ± 0.3m) to get a robust count.
+  // FIX: previously computed z_min/z_max but then only searched target_z —
+  // the band is now actually used in the loop.
   // ============================================================
-  int countUnknownVoxelsAtAltitude(double target_z)
+  int countUnknownVoxelsAtAltitude(double target_z, double pos_x, double pos_y,
+                                    std::shared_ptr<octomap::OcTree> octomap_snap)
   {
-    // We check a thin band at the target altitude
     double z_min = target_z - 0.3;
     double z_max = target_z + 0.3;
     
     int unknown_count = 0;
-    double resolution = octomap_->getResolution();
+    double resolution = octomap_snap->getResolution();
 
-    // Sample a grid of points at the target altitude
-    // and check which ones have no OctoMap data (= unknown)
-    for (double x = current_x_ - 5.0; x < current_x_ + 5.0; x += resolution) {
-      for (double y = current_y_ - 5.0; y < current_y_ + 5.0; y += resolution) {
-        
-        octomap::OcTreeNode* node = octomap_->search(x, y, target_z);
-        
-        // If search returns nullptr, the voxel is unknown (never observed)
-        if (node == nullptr) {
-          unknown_count++;
+    // Sample a grid of points across the altitude band and count cells with
+    // no OctoMap data (nullptr = never observed = unknown).
+    for (double x = pos_x - 5.0; x < pos_x + 5.0; x += resolution) {
+      for (double y = pos_y - 5.0; y < pos_y + 5.0; y += resolution) {
+        for (double z = z_min; z <= z_max; z += resolution) {
+          octomap::OcTreeNode* node = octomap_snap->search(x, y, z);
+          if (node == nullptr) {
+            unknown_count++;
+          }
         }
       }
     }
@@ -423,6 +465,9 @@ private:
   double current_x_, current_y_;              // Drone's X, Y position
   bool has_octomap_;                          // Flag: do we have map data?
   bool has_odom_;                             // Flag: do we have pose data?
+  bool altitude_shifting_;                    // Cooldown: true while Z-Supervisor move is executing
+  double altitude_target_;                    // Target altitude set by Z-Supervisor
+  std::mutex data_mutex_;                     // Protects all shared state above
 
   // Parameters
   double slice_thickness_;
